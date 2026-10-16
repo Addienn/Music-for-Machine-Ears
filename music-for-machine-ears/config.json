@@ -1,0 +1,12 @@
+{
+  "timbre_layers": {
+    "enabled": false,
+    "python": "",
+    "model": "htdemucs",
+    "device": "cpu",
+    "jobs": 1,
+    "slice_seconds": 20.0,
+    "cleanup_temporary_audio": true,
+    "allow_model_download": false
+  }
+}

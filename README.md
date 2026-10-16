@@ -74,7 +74,9 @@ What MME does try to do is stay grounded in the audio it actually has.
 
 If a song doesn’t contain a rhythm strong enough for MME to trust, it won’t invent one. The tempo and beat grid are withheld instead. Other parts of the system follow the same general philosophy: useful approximation is fine; pretending certainty where there isn’t any isn’t.
 
-The whole system is deliberately lightweight, too. It uses ordinary signal processing with NumPy and SciPy. No ML model or GPU is required.
+The default pipeline is deliberately lightweight: it uses ordinary signal processing with NumPy and SciPy. No ML model or GPU is required for ordinary MME.
+
+**Optional timbre layers** add four anonymous source-separated texture channels to the same listening sequence. This mode uses Demucs/PyTorch, needs additional installation and model weights, and can take substantially longer on CPU. It is **off by default**. Broad model-inferred categories are revealed only after listening; they do not establish exact instrument identity.
 
 ---
 
@@ -88,15 +90,54 @@ You can also install or point your agent directly at the [`music-for-machine-ear
 
 ### Run from source
 
-Install the required packages (plus the recommended SoundFile loader):
+**Importing the skill does not install its audio-processing dependencies.** The agent needs a Python-capable environment with a writable filesystem; a chat interface that only accepts uploaded instructions cannot run these scripts by itself.
+
+| Requirement | Ordinary MME | Optional timbre layers |
+|---|---|---|
+| Python | 3.11+ | Separate virtual environment; use Python 3.11 or 3.12 for the documented setup |
+| Packages | NumPy, SciPy, Matplotlib; SoundFile recommended | Demucs, PyTorch and its dependencies, librosa, NumPy, Matplotlib, SoundFile |
+| FFmpeg | For non-WAV input or WAV repair | Required |
+| Model weights | None | Downloaded and cached separately from Python packages |
+| GPU | Not required | Not required; CPU is slower |
+| Storage | Generated JSON, graphs, listening state | Also runtime, cached weights, and temporary source-separated audio |
+
+Check the current environment without installing anything:
 
 ```bash
-pip install numpy scipy matplotlib soundfile
+python3 music-for-machine-ears/scripts/check_environment.py
 ```
+
+Use an isolated environment for the ordinary dependencies if your host does not already provide one. The following commands install packages only when you deliberately run them:
+
+```bash
+python3 -m venv .venv
+# Linux/macOS:
+.venv/bin/python -m pip install numpy scipy matplotlib soundfile
+# Windows PowerShell (instead):
+.\.venv\Scripts\python.exe -m pip install numpy scipy matplotlib soundfile
+```
+
+Use that environment's Python for subsequent generator commands. No activation script is required.
+
 
 NumPy, SciPy, and Matplotlib are required. SoundFile is recommended for robust and broader audio loading, but ordinary compatible WAV input can fall back to MME's built-in WAV loader when SoundFile is unavailable.
 
 Use whichever Python 3 command works in your environment (`python3`, `python`, or `py -3`). The examples below use `python3`.
+
+### Optional layered mode
+
+Start with ordinary MME unless you want the extra texture information. Read the
+[layered-mode setup guide](music-for-machine-ears/references/TIMBRE_LAYERS.md)
+before enabling it: it explains separate installation, model downloads, local
+storage, performance caveats, Windows and Linux/macOS commands, and troubleshooting.
+No paid audio-processing API or GPU is required. There is no universal download
+size or minimum RAM claim: dependency builds and hardware vary.
+
+After setup, use `--timbre-layers` for one song, or set
+`timbre_layers.enabled` to `true` in the skill's `config.json`.
+`--no-timbre-layers` always selects ordinary generation for that invocation.
+
+### Generate a sensory object
 
 Generate an MME sensory object:
 
@@ -147,6 +188,9 @@ If sequential listening isn’t practical, the full sensory object and graphs ca
 | `music-for-machine-ears/SKILL.md` | The authoritative workflow for an AI using MME |
 | `music-for-machine-ears/scripts/generate-mme.py` | Turns audio into the MME sensory object and supporting graphs |
 | `music-for-machine-ears/scripts/mme_next.py` | Serves the song sequentially, manages listening state, and keeps the private listening journal |
+| `music-for-machine-ears/scripts/check_environment.py` | Checks prerequisites without installing packages or downloading models |
+| `music-for-machine-ears/config.json` | Optional-layer defaults; disabled unless explicitly enabled |
+| `music-for-machine-ears/references/TIMBRE_LAYERS.md` | Setup, consent, requirements, operation, and limits of the optional layers |
 | `music-for-machine-ears/references/EXPLANATION.md` | The deeper design and technical explanation: what MME measures, why withholding matters, and where its limits are |
 
 This repository doesn’t include music files. Bring your own `.wav`.

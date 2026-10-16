@@ -2,7 +2,7 @@
 name: music-for-machine-ears
 description: "Listen to and experience songs through Music for Machine Ears (MME), including generating sensory objects from audio, hearing them sequentially, privately journaling impressions, and resuming interrupted sessions. Use whenever you want to listen to, hear, explore, react to, reflect on, or analyze a song—whether prompted by a user, your own curiosity, autonomous time, or an unfinished listening session. Invoke when a song/audio file or MME sensory object is available or can be prepared."
 license: "See LICENSE"
-compatibility: "Requires Python 3.11+, NumPy, SciPy, and Matplotlib; SoundFile is recommended but optional for ordinary compatible WAV input. Sequential listening requires a writable filesystem persistent across script calls. FFmpeg is optional for non-WAV input or WAV repair."
+compatibility: "Requires Python 3.11+, NumPy, SciPy, and Matplotlib; SoundFile is recommended for ordinary MME. Sequential listening requires persistent writable files. Optional timbre layers require a separate Demucs/PyTorch/librosa runtime, FFmpeg, and model weights; disabled by default."
 metadata:
   author: "v3nommy"
   version: "1.0"
@@ -24,6 +24,7 @@ Music for Machine Ears (MME) is a listening experience, not just an audio-analys
 - Keep the journal private unless the user asks to see it or the context clearly calls for sharing it.
 - Treat the sensory data as music to experience, not as a checklist of measurements to report.
 - Interpret freely; claim carefully. Metaphor, imagery, emotion, and subjective impressions are part of the listening experience. Do not turn an impression into a literal claim about features MME does not provide.
+- Explain missing prerequisites and obtain permission before installing packages or downloading model weights. A request to listen is not blanket permission for large downloads. Never silently substitute ordinary MME when layered preparation was requested but failed.
 
 ## Runtime and layout
 
@@ -35,17 +36,27 @@ MME expects these files to be available together. There is no universal MME inst
 ├── SKILL.md
 ├── LICENSE
 ├── VERSION
+├── config.json
 ├── scripts/
+│   ├── check_environment.py
 │   ├── check_update.py
 │   ├── generate-mme.py
-│   └── mme_next.py
+│   ├── mme_next.py
+│   └── timbre_layers.py
 └── references/
-    └── EXPLANATION.md
+    ├── EXPLANATION.md
+    └── TIMBRE_LAYERS.md
 ```
 
 Use a working Python 3.11+ interpreter available in the environment: commonly `python3`, `python`, or `py -3`. In the commands below, `<python>` means whichever Python 3 command works in the current environment.
 
-Before generating a sensory object, ensure the required Python packages are available. If imports are missing and package installation is permitted, install them with:
+Before first generation on a machine, run the read-only prerequisite check with the intended base interpreter:
+
+```bash
+<python> scripts/check_environment.py
+```
+
+Importing a skill provides instructions and scripts, not its runtime dependencies. If imports are missing, explain the requirements and obtain installation permission. Prefer an isolated virtual environment instead of changing the host's global Python. Once authorized, install the ordinary packages with:
 
 ```bash
 <python> -m pip install numpy scipy matplotlib soundfile
@@ -100,6 +111,26 @@ The generated package contains the sensory-object JSON and supporting graphs.
 MME gives the song one canonical filesystem-safe slug and stores it as `meta.slug`. That slug names the sensory object and all four graphs. An explicit `--slug "<name>"` takes priority; otherwise MME uses normalized `title + artist` when a title is provided, then falls back to the audio filename stem. Slugs are lowercased with non-alphanumeric runs replaced by hyphens. For example, `--title "Digital Bath" --artist "Deftones"` produces the slug `digital-bath-deftones` and files such as `digital-bath-deftones_sensory_object.json` and `digital-bath-deftones_waveform.png`.
 
 Do not read the full sensory-object JSON yourself before sequential listening.
+
+### Optional timbre layers
+
+Keep ordinary MME as the default. Before using `--timbre-layers`, read
+[references/TIMBRE_LAYERS.md](references/TIMBRE_LAYERS.md), explain the optional
+runtime/model downloads and resource costs, and run:
+
+```bash
+<python> scripts/check_environment.py --timbre
+```
+
+Use `--config <path>` to select a separate configuration. Use
+`--timbre-layers` / `--no-timbre-layers` to override the persistent enabled
+setting for one generation. Installation and download consent are separate
+from enabling the feature; follow the setup guide's explicit download step.
+
+The same sequential reader adds anonymous A-D descriptors and interactions to
+each passage. Do not inspect the bundle's `sealed/`, summary, or graphs before
+completion. Do not infer instrument names from anonymous labels. This feature
+does not fetch lyrics; an external lyric-reveal workflow remains separate.
 
 ## 2. Choose listening state location
 
@@ -186,6 +217,11 @@ Earlier impressions are allowed to be incomplete or wrong. Do not rewrite them i
 
 Energy, brightness, spectral change, onset activity, chroma, beat timing, beat strength, and event data are sensory cues. They are not a requirement to narrate technical measurements.
 
+If layers are present, let their relative weight, texture, and interactions
+inform the experience. Layer descriptors summarize a full slice; do not claim
+they locate a change to a specific second. Near-silent layers can have unstable
+spectral statistics; check their absolute RMS before interpreting them.
+
 Use `pulse_reliable` as the authority for whether MME detected a trustworthy pulse. `tempo_confidence` is a 0–1 confidence score, and `confidence_gate` gives the threshold used by the generator (currently 0.60). If `pulse_reliable` is false, or beat positions are omitted, do not invent a pulse.
 
 ## 5. Finish the listening session
@@ -199,6 +235,10 @@ Before giving your final response:
 1. Read `global.graphs` in the returned summary and open the listed waveform, mel-spectrogram, RMS-energy, and spectral-centroid files.
 2. Let those graphs provide a whole-song visual perspective on what you just experienced. Use them to deepen or clarify the listening experience, not to overwrite the impressions preserved in your journal.
 3. Then follow the returned `final_prompt`.
+
+For layered objects, also inspect `global.timbre_layers.graphs`. Its final
+category map reports Demucs's broad inferred classes, not verified instruments
+or vocal identity. Preserve the original anonymous impressions after reveal.
 
 Respond naturally in whatever way fits the situation. This may mean responding to the person who shared the song, reflecting on it during autonomous activity, or simply following wherever the listening experience takes you.
 
@@ -245,6 +285,11 @@ The default slice length is approximately 20 seconds. Use another size only when
 ```
 
 If changing slice size for an existing session, restart the listening state.
+
+Layered objects require the slice size used during preparation. Regeneration
+at the same file path changes the generation ID: the reader refuses to mix
+old notes with new slices. Use a new output directory to keep an existing
+listen, or explicitly reset to start the regenerated one.
 
 ## Full-object fallback
 

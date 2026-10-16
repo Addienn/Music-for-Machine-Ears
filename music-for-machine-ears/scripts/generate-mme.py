@@ -1,10 +1,25 @@
-import os, json, math, datetime, re, subprocess, tempfile, shutil, unicodedata, warnings
-import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+import os, json, math, datetime, re, secrets, subprocess, sys, tempfile, shutil, unicodedata, warnings
+from contextlib import contextmanager
+from pathlib import Path
+from check_environment import (
+    DEFAULT_CONFIG_PATH,
+    DEFAULT_TIMBRE_CONFIG,
+    load_mme_config,
+    resolve_timbre_config,
+    candidate_timbre_python as _candidate_timbre_python,
+    preflight_timbre,
+)
 
-from scipy import signal, ndimage
+try:
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from scipy import signal, ndimage
+except (ImportError, OSError) as exc:
+    raise SystemExit(
+        f"MME base dependencies unavailable: {exc}. Run scripts/check_environment.py for setup guidance."
+    ) from None
 
 # Optional (preferred) WAV reading:
 try:
@@ -56,6 +71,176 @@ MINOR_PROFILE = np.array([6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34
 
 MAJOR_PROFILE /= MAJOR_PROFILE.sum()
 MINOR_PROFILE /= MINOR_PROFILE.sum()
+
+
+def mme_slice_count(duration, seconds):
+    total = max(1, math.ceil(duration / seconds))
+    tail = duration % seconds
+    if total > 1 and 0 < tail < seconds * 0.25:
+        total -= 1
+    return total
+
+
+def generate_timbre_bundle(audio_path, out_dir, title, output_base, duration, expected_slices, config):
+    """Run optional layered preparation in its own Python process."""
+    python = _candidate_timbre_python(config.get("python"))
+    script = Path(__file__).resolve().with_name("timbre_layers.py")
+    bundle_name = f"{output_base}_timbre_{secrets.token_hex(6)}"
+    command = [
+        python,
+        str(script),
+        "--audio", str(Path(audio_path).resolve()),
+        "--out-dir", str(Path(out_dir).resolve()),
+        "--slug", output_base,
+        "--bundle-name", bundle_name,
+        "--title", str(title or ""),
+        "--source-label", os.path.basename(audio_path),
+        "--slice-seconds", str(float(config.get("slice_seconds", 20.0))),
+        "--duration-seconds", repr(float(duration)),
+        "--slice-count", str(int(expected_slices)),
+        "--model", str(config.get("model", "htdemucs")),
+        "--device", str(config.get("device", "cpu")),
+        "--jobs", str(int(config.get("jobs", 1))),
+    ]
+    if config.get("allow_model_download") is True:
+        command.append("--allow-model-download")
+    if not bool(config.get("cleanup_temporary_audio", True)):
+        command.append("--keep-temporary-audio")
+    bundle_path = Path(out_dir).resolve() / bundle_name
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Could not start optional timbre runtime {python!r}. Configure timbre_layers.python "
+            "or MME_TIMBRE_PYTHON."
+        ) from exc
+    if result.returncode != 0:
+        if bundle_path.exists() and bundle_path.parent == Path(out_dir).resolve():
+            remove_trusted_timbre_bundle(bundle_path, out_dir)
+        detail = (result.stderr or result.stdout or "unknown error")[-2000:]
+        raise RuntimeError(f"Optional timbre-layer preparation failed: {detail}")
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        orphan = Path(out_dir).resolve() / bundle_name
+        if orphan.exists() and orphan.parent == Path(out_dir).resolve():
+            shutil.rmtree(orphan, ignore_errors=True)
+        raise RuntimeError("Optional timbre-layer preparation returned no result.")
+    try:
+        payload = json.loads(lines[-1])
+        if payload.get("bundle_dir") != bundle_name:
+            raise RuntimeError("Optional timbre-layer preparation returned an unexpected bundle path.")
+        if int(payload.get("slice_count", -1)) != int(expected_slices):
+            raise RuntimeError("Optional timbre-layer preparation returned a mismatched slice count.")
+        if not math.isclose(
+            float(payload.get("slice_seconds", 0)),
+            float(config.get("slice_seconds", 20.0)),
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise RuntimeError("Optional timbre-layer preparation returned a mismatched slice size.")
+    except (ValueError, TypeError, RuntimeError) as exc:
+        if bundle_path.exists() and bundle_path.parent == Path(out_dir).resolve():
+            shutil.rmtree(bundle_path, ignore_errors=True)
+        if isinstance(exc, RuntimeError):
+            raise
+        raise RuntimeError(f"Optional timbre-layer preparation returned invalid JSON data: {lines[-1]}") from exc
+    return payload
+
+
+def _is_link_or_junction(path):
+    is_junction = getattr(os.path, "isjunction", lambda value: False)
+    return path.is_symlink() or is_junction(path)
+
+
+def prior_timbre_bundle(json_path, out_dir, output_base):
+    """Return the currently referenced bundle only when it is a safe direct child."""
+    path = Path(json_path)
+    if not path.is_file():
+        return None
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    name = str(existing.get("timbre_layers", {}).get("bundle_dir") or "")
+    candidate = Path(out_dir).resolve() / name
+    expected_prefix = f"{output_base}_timbre_"
+    if (
+        not name
+        or Path(name).name != name
+        or re.fullmatch(re.escape(expected_prefix) + r"[0-9a-f]{12}", name) is None
+        or candidate.parent != Path(out_dir).resolve()
+        or not candidate.is_dir()
+        or _is_link_or_junction(candidate)
+    ):
+        return None
+    resolved = candidate.resolve()
+    if resolved.parent != Path(out_dir).resolve():
+        return None
+    manifest_path = candidate / "manifest.json"
+    if not manifest_path.is_file() or _is_link_or_junction(manifest_path):
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if manifest.get("format") != "mme-timbre-v1" or manifest.get("bundle_id") != name:
+        return None
+    return candidate
+
+
+def write_json_atomic(path, payload):
+    path = Path(path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def generation_lock(out_dir, output_base):
+    """Serialize same-slug generation and publication across processes."""
+    lock_path = Path(out_dir).resolve() / f".{output_base}.mme-generate.lock"
+    try:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise RuntimeError(
+            f"Another MME generation for slug {output_base!r} is already running. "
+            f"If it crashed, inspect and remove stale lock {lock_path}."
+        ) from exc
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"pid": os.getpid(), "created_utc": datetime.datetime.now(datetime.UTC).isoformat()}))
+            handle.flush()
+            os.fsync(handle.fileno())
+        yield
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
+def remove_trusted_timbre_bundle(bundle, out_dir):
+    """Quarantine the exact validated lexical directory before recursive deletion."""
+    parent = Path(out_dir).resolve()
+    if bundle.parent != parent or not bundle.exists():
+        return
+    quarantine = parent / f".mme-delete-{secrets.token_hex(8)}"
+    os.replace(bundle, quarantine)
+    if _is_link_or_junction(quarantine):
+        if quarantine.is_symlink():
+            quarantine.unlink(missing_ok=True)
+        else:
+            os.rmdir(quarantine)
+    else:
+        shutil.rmtree(quarantine, ignore_errors=True)
+
 
 def compute_adaptive_thresholds(energy_1hz, bright_1hz):
     """Compute percentile-based thresholds from the track's own data."""
@@ -697,9 +882,11 @@ def output_base_name(audio_path, title="", artist="", slug=None):
     audio_stem = os.path.splitext(os.path.basename(audio_path))[0]
     return filename_slug(audio_stem)
 
-def generate_mme(audio_path, out_dir, title="", artist="", slug=None):
+def _generate_mme_unlocked(audio_path, out_dir, title="", artist="", slug=None, timbre_enabled=False, timbre_config=None):
     os.makedirs(out_dir, exist_ok=True)
     output_base = output_base_name(audio_path, title, artist, slug)
+    json_path = os.path.join(out_dir, f"{output_base}_sensory_object.json")
+    old_bundle = prior_timbre_bundle(json_path, out_dir, output_base)
 
     # Convert/repair as needed, then load + resample.
     y, sr = load_audio_with_fallback(audio_path)
@@ -831,11 +1018,13 @@ def generate_mme(audio_path, out_dir, title="", artist="", slug=None):
     obj = {
         "meta": {
             "schema_version": "MME",
+            "generation_id": secrets.token_hex(16),
             "title": title,
             "artist": artist,
             "slug": output_base,
             "source_file": os.path.basename(audio_path),
             "duration_s": float(round(duration_s, 3)),
+            "analysis_duration_s": duration_s,
             "sr_hz": int(sr),
             "hop": int(HOP),
             "n_fft": int(N_FFT),
@@ -869,9 +1058,31 @@ def generate_mme(audio_path, out_dir, title="", artist="", slug=None):
         "interpretive_map": interpretive,
     }
 
-    json_path = os.path.join(out_dir, f"{output_base}_sensory_object.json")
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+    if timbre_enabled:
+        resolved_timbre = resolve_timbre_config(timbre_config or {}, True)
+        layer_slice_seconds = float(resolved_timbre["slice_seconds"])
+        expected_layer_slices = mme_slice_count(duration_s, layer_slice_seconds)
+        obj["timbre_layers"] = generate_timbre_bundle(
+            audio_path,
+            out_dir,
+            title,
+            output_base,
+            duration_s,
+            expected_layer_slices,
+            resolved_timbre,
+        )
+
+    keep_bundle = None
+    if timbre_enabled:
+        keep_bundle = Path(out_dir).resolve() / obj["timbre_layers"]["bundle_dir"]
+    try:
+        write_json_atomic(json_path, obj)
+    except Exception:
+        if keep_bundle and keep_bundle.exists() and keep_bundle.parent == Path(out_dir).resolve():
+            shutil.rmtree(keep_bundle, ignore_errors=True)
+        raise
+    if old_bundle and old_bundle.exists() and old_bundle.resolve() != (keep_bundle.resolve() if keep_bundle else None):
+        remove_trusted_timbre_bundle(old_bundle, out_dir)
 
     return {
         "json": json_path,
@@ -881,7 +1092,35 @@ def generate_mme(audio_path, out_dir, title="", artist="", slug=None):
         "centroid": sc_path,
     }
 
-if __name__ == "__main__":
+
+def generate_mme(audio_path, out_dir, title="", artist="", slug=None, timbre_enabled=False, timbre_config=None):
+    if timbre_enabled:
+        timbre_config = resolve_timbre_config(timbre_config or {}, True)
+        if not timbre_config["allow_model_download"]:
+            raise RuntimeError(
+                "Timbre layers require model-download permission: use --allow-model-download "
+                "or config timbre_layers.allow_model_download=true."
+            )
+        preflight_timbre(timbre_config)
+        print(
+            f"Model {timbre_config['model']}: cache status unknown. Permission granted for "
+            "Demucs-managed retrieval; cached weights may be reused, but network access may occur.",
+            file=sys.stderr,
+        )
+    os.makedirs(out_dir, exist_ok=True)
+    output_base = output_base_name(audio_path, title, artist, slug)
+    with generation_lock(out_dir, output_base):
+        return _generate_mme_unlocked(
+            audio_path,
+            out_dir,
+            title,
+            artist,
+            slug,
+            timbre_enabled=timbre_enabled,
+            timbre_config=timbre_config,
+        )
+
+def main():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--audio", required=True)
@@ -893,7 +1132,52 @@ if __name__ == "__main__":
         default=None,
         help="Optional canonical output-name override; otherwise uses title + artist when provided, then the input audio filename",
     )
+    ap.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="MME configuration JSON path")
+    ap.add_argument(
+        "--allow-model-download",
+        action="store_true",
+        help="Permit Demucs to retrieve/cache model weights; does not enable timbre layers",
+    )
+    timbre_group = ap.add_mutually_exclusive_group()
+    timbre_group.add_argument(
+        "--timbre-layers",
+        dest="timbre_layers",
+        action="store_true",
+        help="Enable optional anonymous Demucs-derived timbre layers for this generation",
+    )
+    timbre_group.add_argument(
+        "--no-timbre-layers",
+        dest="timbre_layers",
+        action="store_false",
+        help="Disable optional timbre layers for this generation",
+    )
+    ap.set_defaults(timbre_layers=None)
     args = ap.parse_args()
 
-    out = generate_mme(args.audio, args.out_dir, args.title, args.artist, args.slug)
+    if args.timbre_layers is False:
+        # An explicit ordinary-mode override must not be blocked by stale or
+        # malformed settings for an optional heavy feature.
+        timbre_config = resolve_timbre_config(DEFAULT_TIMBRE_CONFIG, False)
+    else:
+        config = load_mme_config(args.config)
+        timbre_config = resolve_timbre_config(config["timbre_layers"], args.timbre_layers)
+    if args.allow_model_download:
+        timbre_config["allow_model_download"] = True
+    timbre_enabled = timbre_config["enabled"]
+    out = generate_mme(
+        args.audio,
+        args.out_dir,
+        args.title,
+        args.artist,
+        args.slug,
+        timbre_enabled=timbre_enabled,
+        timbre_config=timbre_config,
+    )
     print("Wrote:", out)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, OSError) as exc:
+        raise SystemExit(f"MME: {exc}") from None
