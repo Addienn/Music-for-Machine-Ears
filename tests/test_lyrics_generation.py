@@ -26,9 +26,10 @@ class GeneratorCliTests(unittest.TestCase):
             opt = json.loads((root / 'optional/tone_sensory_object.json').read_text())
             self.assertNotIn('lyrics', base)
             self.assertEqual(opt.pop('lyrics')['lyric_onset_s'], 3)
-            # Only generation wall-clock metadata can differ between runs.
+            # Publication identity and wall-clock metadata differ between runs.
             for obj in [base, opt]:
                 obj['meta'].pop('created_utc')
+                obj['meta'].pop('generation_id')
             self.assertEqual(base, opt)
 
     def test_bad_lyrics_fail_before_audio_processing(self):

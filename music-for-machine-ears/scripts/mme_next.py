@@ -54,8 +54,56 @@ def in_window(t, start, end, last):
     return start <= t <= end if last else start <= t < end
 
 
-def make_slice(obj, index, seconds):
-    duration = float(obj["meta"]["duration_s"])
+def object_duration(obj):
+    meta = obj["meta"]
+    return float(meta.get("analysis_duration_s", meta["duration_s"]))
+
+
+def timbre_bundle_path(obj, input_path):
+    metadata = obj.get("timbre_layers")
+    if not isinstance(metadata, dict) or not metadata.get("enabled"):
+        return None
+    bundle_name = str(metadata.get("bundle_dir") or "").strip()
+    if not bundle_name or Path(bundle_name).is_absolute():
+        raise SystemExit("Invalid timbre-layer bundle reference in sensory object.")
+    parent = input_path.parent.resolve()
+    bundle = (parent / bundle_name).resolve()
+    if parent != bundle and parent not in bundle.parents:
+        raise SystemExit("Timbre-layer bundle reference escapes the sensory-object directory.")
+    return bundle
+
+
+def contained_bundle_file(bundle, *parts):
+    candidate = bundle.joinpath(*parts).resolve()
+    if bundle != candidate and bundle not in candidate.parents:
+        raise SystemExit("Timbre-layer file reference escapes its bundle.")
+    return candidate
+
+
+def timbre_slice_payload(obj, input_path, index, start, end, total):
+    bundle = timbre_bundle_path(obj, input_path)
+    if bundle is None:
+        return None
+    path = contained_bundle_file(bundle, "slices", f"{index + 1:03d}.json")
+    if not path.is_file():
+        raise SystemExit(f"Timbre-layer slice is missing: {path}")
+    data = read_json(path)
+    if (
+        int(data.get("slice", -1)) != index + 1
+        or int(data.get("slice_count", -1)) != total
+        or not math.isclose(float(data.get("start_seconds", -1)), start, rel_tol=0.0, abs_tol=1e-3)
+        or not math.isclose(float(data.get("end_seconds", -1)), end, rel_tol=0.0, abs_tol=1e-3)
+    ):
+        raise SystemExit("Timbre-layer slice boundaries do not match the ordinary MME slice.")
+    return {
+        "anonymous_layers": data.get("layers", {}),
+        "anonymous_interactions": data.get("interactions", []),
+        "provenance": obj["timbre_layers"].get("provenance"),
+    }
+
+
+def make_slice(obj, index, seconds, input_path=None):
+    duration = object_duration(obj)
     total = slice_count(duration, seconds)
     start = index * seconds
     end = duration if index == total - 1 else min(duration, (index + 1) * seconds)
@@ -99,7 +147,7 @@ def make_slice(obj, index, seconds):
     else:
         local_times, local_strength = None, None
 
-    return {
+    payload = {
         "stage": "slice",
         "slice_index": index + 1,
         "slice_count": total,
@@ -124,6 +172,11 @@ def make_slice(obj, index, seconds):
             "listening experience, and grounded only in what has been heard so far."
         ),
     }
+    if input_path is not None:
+        layered = timbre_slice_payload(obj, input_path, index, start, end, total)
+        if layered is not None:
+            payload["sensory"]["timbre_layers"] = layered
+    return payload
 
 
 def lyrics_for_window(obj, start, end, last):
@@ -170,12 +223,34 @@ def graph_refs(obj, input_path):
     return [str((input_path.parent / name).resolve()) for name in names if (input_path.parent / name).exists()]
 
 
+def timbre_summary(obj, input_path):
+    bundle = timbre_bundle_path(obj, input_path)
+    if bundle is None:
+        return None
+    summary_path = contained_bundle_file(bundle, "summary.json")
+    map_path = contained_bundle_file(bundle, "sealed", "stem_map.json")
+    if not summary_path.is_file() or not map_path.is_file():
+        raise SystemExit("Completed timbre-layer bundle is missing its summary or sealed map.")
+    summary = read_json(summary_path)
+    graphs = []
+    for relative in summary.get("anonymous_graphs", []):
+        candidate = contained_bundle_file(bundle, str(relative))
+        if candidate.is_file():
+            graphs.append(str(candidate))
+    return {
+        "summary": summary,
+        "revealed_stem_map": read_json(map_path),
+        "graphs": graphs,
+        "provenance": obj["timbre_layers"].get("provenance"),
+    }
+
+
 
 def make_summary(obj, input_path, journal_path):
     meta = obj.get("meta", {})
     rhythm = obj.get("rhythm", {})
 
-    return {
+    payload = {
         "stage": "summary",
         "message": "Listening sequence complete. These whole-track fields were intentionally withheld until now.",
         "global": {
@@ -211,6 +286,15 @@ def make_summary(obj, input_path, journal_path):
             "actually heard and experienced rather than turning it into a technical analysis unless that fits the moment."
         ),
     }
+    layered = timbre_summary(obj, input_path)
+    if layered is not None:
+        payload["global"]["timbre_layers"] = layered
+        payload["final_prompt"] += (
+            " The optional timbre-layer map is now revealed. Treat Demucs category names as inferred broad "
+            "separation classes, not ground truth or proof of specific instruments, and inspect the listed "
+            "layered graphs alongside the ordinary MME graphs."
+        )
+    return payload
 
 
 def emit(payload, code=0):
@@ -253,10 +337,24 @@ def main():
     obj = json.loads(input_bytes)
     if "meta" not in obj or "time_series_1hz" not in obj:
         raise SystemExit("Input does not look like an MME sensory object.")
+    timbre = obj.get("timbre_layers")
+    if isinstance(timbre, dict) and timbre.get("enabled"):
+        prepared_seconds = float(timbre.get("slice_seconds", 0))
+        if not math.isclose(prepared_seconds, args.slice_seconds, rel_tol=0.0, abs_tol=1e-6):
+            raise SystemExit(
+                f"This sensory object has timbre layers prepared at {prepared_seconds:g}-second slices. "
+                "Use that --slice-seconds value or regenerate the object."
+            )
 
     state_dir = (args.state_dir or input_path.parent / ".mme-listening" / input_path.stem).resolve()
     cursor_path = state_dir / "cursor.json"
     journal_path = state_dir / "journal.md"
+    current_generation = obj.get("meta", {}).get("generation_id")
+    current_bundle = (
+        str(timbre.get("bundle_dir") or "")
+        if isinstance(timbre, dict) and timbre.get("enabled")
+        else None
+    )
 
     if args.reset:
         for path in (cursor_path, journal_path):
@@ -270,11 +368,17 @@ def main():
         state = read_json(cursor_path)
         if state.get("input_path") != str(input_path) or float(state.get("slice_seconds", 0)) != args.slice_seconds:
             raise SystemExit("Listening state does not match this file/slice size. Use --reset.")
+        if current_generation is not None and state.get("sensory_generation_id") != current_generation:
+            raise SystemExit("The sensory object changed since this listening session began. Use --reset.")
+        if state.get("timbre_bundle_dir") != current_bundle:
+            raise SystemExit("The timbre-layer bundle changed since this listening session began. Use --reset.")
     else:
-        duration = float(obj["meta"]["duration_s"])
+        duration = object_duration(obj)
         state = {
             "input_path": str(input_path),
             "slice_seconds": args.slice_seconds,
+            "sensory_generation_id": current_generation,
+            "timbre_bundle_dir": current_bundle,
             "slice_count": slice_count(duration, args.slice_seconds),
             "next_slice_index": 0,
             "awaiting_note": False,
@@ -303,7 +407,7 @@ def main():
 
     if args.resume:
         if state["awaiting_note"] and state.get("last_slice_index") is not None:
-            payload = make_slice(obj, int(state["last_slice_index"]), args.slice_seconds)
+            payload = make_slice(obj, int(state["last_slice_index"]), args.slice_seconds, input_path)
             payload = add_slice_lyrics(
                 payload,
                 obj,
@@ -329,7 +433,7 @@ def main():
                     "without advancing."
                 ),
             }, 2)
-        previous = make_slice(obj, int(state["last_slice_index"]), args.slice_seconds)
+        previous = make_slice(obj, int(state["last_slice_index"]), args.slice_seconds, input_path)
         r = previous["time_range_s"]
         journal_path.parent.mkdir(parents=True, exist_ok=True)
         with open(journal_path, "a", encoding="utf-8") as f:
@@ -348,7 +452,7 @@ def main():
         write_json(cursor_path, state)
         emit(make_summary(obj, input_path, journal_path))
 
-    payload = make_slice(obj, index, args.slice_seconds)
+    payload = make_slice(obj, index, args.slice_seconds, input_path)
     payload = add_slice_lyrics(
         payload,
         obj,

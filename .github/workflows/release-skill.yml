@@ -111,10 +111,14 @@ jobs:
               "music-for-machine-ears/SKILL.md",
               "music-for-machine-ears/LICENSE",
               "music-for-machine-ears/VERSION",
+              "music-for-machine-ears/config.json",
+              "music-for-machine-ears/scripts/check_environment.py",
               "music-for-machine-ears/scripts/check_update.py",
               "music-for-machine-ears/scripts/generate-mme.py",
               "music-for-machine-ears/scripts/mme_next.py",
+              "music-for-machine-ears/scripts/timbre_layers.py",
               "music-for-machine-ears/references/EXPLANATION.md",
+              "music-for-machine-ears/references/TIMBRE_LAYERS.md",
           }
 
           with zipfile.ZipFile(archive) as zf:
